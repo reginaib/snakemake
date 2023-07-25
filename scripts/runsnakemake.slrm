@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH --account="lp_edu_large_omics"
+#SBATCH --job-name="vcf"
+#SBATCH --cluster="wice"
+#SBATCH --partition="batch"
+#SBATCH -N 1
+#SBATCH -n 8
+#SBATCH -t 4:00:00
+#SBATCH --mem=50G
+
+export PATH=/staging/leuven/stg_00079/teaching/miniconda3/envs/large_omics_2023_b/bin:$PATH
+cd "/data/leuven/350/vsc35081/scratch/exercise2_work"
+date
+snakemake -s /data/leuven/350/vsc35081/exercise2_project/Snakefile -c 8

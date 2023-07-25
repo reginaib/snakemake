@@ -1,0 +1,213 @@
+genome_db = "/lustre1/project/stg_00079/teaching/hg19_chrom/chr17/chr17.fasta"
+
+sample_names, sample_reads = glob_wildcards("000.fastq/{name}_{read}.fastq.gz")
+full_names, = glob_wildcards("000.fastq/{name}_1.fastq.gz")
+
+snpeff_jar = ("/lustre1/project/stg_00079/teaching/miniconda3/pkgs"
+              + "/snpeff-5.1-hdfd78af_2/share/snpeff-5.1-2/snpEff.jar")
+snpeff_db_folder = "/staging/leuven/stg_00079/teaching/snpeff_db/"
+
+
+rule all:
+    input:
+        summary=expand("010.fastqc/{name}_{read}_fastqc/summary.png", name=sample_names, read=sample_reads),
+        bam=expand("020.bwa/{name}.bam", name=full_names),
+        vcf="050.snpeff/snps.annotated.vcf",
+        rep="060.mapped/reads.csv"
+
+
+rule fastqc:
+    input:
+        fq="000.fastq/{name}_{read}.fastq.gz"
+    log: "logs/{name}_{read}.fastqc.log"
+    output:
+        zip="010.fastqc/{name}_{read}_fastqc.zip",
+        html="010.fastqc/{name}_{read}_fastqc.html",
+        summarytxt="010.fastqc/{name}_{read}_fastqc/summary.txt",
+        basequal=report("010.fastqc/{name}_{read}_fastqc/Images/per_base_quality.png",
+                        category='FastQC',
+                        subcategory='Per base quality',
+                        labels={"sample": "{name}_{read}"})
+
+    shell:
+        """
+        echo "Input Fastq: {input.fq}"
+
+        fastqc -o 010.fastqc {input.fq}
+
+        echo "Unzip the output"
+        unzip -o -d 010.fastqc {output.zip}
+
+        if [[ $(grep -m 1 WARN {output.summarytxt}) ]]; then
+            echo "warnings found {input.fq}" >> {log}
+        fi
+        if [[ $(grep -m 1 FAIL {output.summarytxt}) ]]; then
+            echo "fails found {input.fq}" >> {log}
+        fi
+        """
+
+
+rule fastqc_report_image:
+    input:
+        summarytxt="010.fastqc/{name}_{read}_fastqc/summary.txt"
+    output:
+        statuspng=report("010.fastqc/{name}_{read}_fastqc/summary.png",
+                         category='FastQC',
+                         subcategory='Status',
+                         labels={"sample": "{name}_{read}"})
+
+    run:
+        import pandas as pd
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+
+        #load data
+        data = pd.read_csv(input.summarytxt, sep="\t", header=None)
+        data.columns = ['status', 'test', 'sample']
+
+        #assign dummy x value for scatterplot
+        data['x'] = 1
+
+        #create image
+        fig = plt.figure(figsize=(4,5))
+        ax = plt.gca()
+        sns.scatterplot(data, x='x', y='test', hue='status', s=200, ax=ax)
+        ax.get_xaxis().set_visible(False)
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        plt.tight_layout()
+        plt.title(f'{wildcards.name} ({wildcards.read})')
+        plt.savefig(output.statuspng)
+
+
+rule bwa:
+    input:
+        fq1="000.fastq/{name}_1.fastq.gz",
+        fq2="000.fastq/{name}_2.fastq.gz",
+    log: 
+        "logs/{name}.bwa.log",
+    output:
+        bam = "020.bwa/{name}.bam",
+        bai = "020.bwa/{name}.bam.bai",
+    params:
+        db=genome_db,
+    threads: 8
+    shell:
+        """
+        if [[ $(file -b --mime-type -L {input.fq1}) != 'application/x-gzip' ]]; then
+            echo "invalid gzip file $(file -b --mime-type -L {input.fq1}) {input.fq1}" >> {log}
+            exit 1
+        fi
+        if [[ $(file -b --mime-type -L {input.fq2}) != 'application/x-gzip' ]]; then
+            echo "invalid gzip file $(file -b --mime-type -L {input.fq2}) {input.fq2}" >> {log}
+            exit 1
+        fi
+
+        num_lines=`zcat {input.fq1} | wc -l`
+        if [ $(expr $num_lines % 4) != 0 ]; then
+            echo "invalid number of lines in file {input.fq1}" >> {log}
+            exit 1
+        fi
+        num_lines=`zcat {input.fq2} | wc -l`
+        if [ $(expr $num_lines % 4) != 0 ]; then
+            echo "invalid number of lines in file {input.fq2}" >> {log}
+            exit 1
+        fi
+
+        bwa mem -t {threads} {params.db} {input.fq1} {input.fq2} \
+            | samtools sort - \
+            > {output.bam}
+        samtools index {output.bam}
+        """
+
+
+rule variant_calling:
+    input:
+        db=genome_db,
+        bam=expand("020.bwa/{name}.bam", name=full_names),
+    output:
+        vcf="030.samtools/snps.vcf",
+    shell:
+        """
+        bcftools mpileup -Ou -f {input.db} {input.bam} \
+             | bcftools call -mv -Ov -o {output.vcf}
+        """
+
+
+rule variant_cleanup:
+    input:
+        db=genome_db,
+        vcf="030.samtools/snps.vcf"
+    output:
+        vcf="040.cleaned/snps.cleaned.vcf"
+    shell:
+        """
+        ( cat {input.vcf} \
+           | vt decompose - \
+           | vt normalize -n -r {input.db} - \
+           | vt uniq - \
+           | vt view -f "QUAL>20" -h - \
+           > {output.vcf} )
+        """
+
+
+rule snpeff:
+    input:
+        vcf = "040.cleaned/snps.cleaned.vcf",
+    params:
+        snpeff_db_folder = snpeff_db_folder,
+        snpeff_jar = snpeff_jar,
+ 
+    output:
+        vcf = "050.snpeff/snps.annotated.vcf",
+        html = "050.snpeff/snpEff_summary.html",
+        genetxt = "050.snpeff/snpEff_genes.txt",
+    shell:
+        """
+        java -Xmx4096m -jar \
+            {params.snpeff_jar} eff hg19 \
+            -dataDir {params.snpeff_db_folder} \
+            {input.vcf} > {output.vcf}
+
+        # move output files to the snpeff output folder
+        mv snpEff_genes.txt snpEff_summary.html 050.snpeff
+
+        """
+
+
+rule extra_a_flagstat:
+    input:
+        bam="020.bwa/{name}.bam"
+    output:
+        json="060.mapped/{name}.json"
+    threads: 8
+    shell:
+        """
+        samtools flagstat -@ {threads} -O json {input.bam} > {output.json}
+        """
+
+
+rule extra_a_table:
+    input:
+        json=expand("060.mapped/{name}.json", name=full_names)
+    output:
+        table="060.mapped/reads.csv",
+        fig=report("060.mapped/reads.png", category='Mapped percentage')
+    run:
+        import pandas as pd
+        import json
+        from matplotlib.pyplot import savefig
+
+        data = []
+        for f in input.json:
+            j = json.load(open(f))["QC-passed reads"]
+            data.append(j)
+
+        data = pd.DataFrame(data)[['mapped %', 'primary mapped %']].copy()
+        data.index = full_names
+        data.to_csv(output.table)
+        data.plot.bar(rot=0)
+        savefig(output.fig)
+
+onsuccess:
+    from snakemake.report import auto_report
+    auto_report(workflow.persistence.dag, "report.html")
